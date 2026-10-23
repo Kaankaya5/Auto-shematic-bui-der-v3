@@ -1,0 +1,130 @@
+# Bu dosya repoda tam olarak şu yolda durmalı:  .github/workflows/build.yml
+# Görevi: projeyi GitHub'ın sunucusunda derlemek ve çıkan .jar'ı "Releases" sayfasına koymak.
+name: build-jar
+
+on:
+  # Repoya her dosya yüklediğinde (commit) otomatik çalışır
+  push:
+    branches: ['**']
+  # Actions sekmesinden "Run workflow" ile elle de çalıştırılabilir
+  workflow_dispatch:
+
+# Release oluşturabilmek için yazma izni gerekir
+permissions:
+  contents: write
+
+# Aynı anda iki derleme çalışırsa eskisini iptal et
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # 1) Repodaki dosyaları sunucuya indir
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      # 2) Proje klasör olarak mı yüklendi, zip olarak mı? İkisini de destekler
+      - name: Projeyi bul
+        run: |
+          set -e
+          if [ -f build.gradle ]; then
+            DIR="."
+          else
+            ZIP=$(ls -1 ./*.zip 2>/dev/null | sort -V | tail -n1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "::error::Repoda ne build.gradle ne de .zip var. Proje zip dosyasını repoya yükle."
+              exit 1
+            fi
+            echo "Zip bulundu: $ZIP"
+            mkdir -p _src
+            unzip -q "$ZIP" -d _src
+            BG=$(find _src -maxdepth 3 -name build.gradle | head -n1)
+            if [ -z "$BG" ]; then
+              echo "::error::Zip içinde build.gradle bulunamadı."
+              exit 1
+            fi
+            DIR=$(dirname "$BG")
+          fi
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "Proje klasörü: $DIR"
+
+      # 3) Minecraft 1.21.11 Java 21 ister
+      - name: Java 21 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 4) Gradle kur (wrapper dosyası gerekmez); indirilenleri önbelleğe alır
+      - name: Gradle 9.2.1 kur
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.2.1'
+
+      # 5) Derle: Minecraft, Fabric ve eşleme dosyalarını indirir, kodu derler, jar'ı üretir
+      - name: Derle
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          gradle build --no-daemon --stacktrace 2>&1 | tee build.log
+
+      # 6) Derleme başarısızsa: hata satırlarını çalışma özetine yaz
+      - name: Hata özeti
+        if: failure()
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          {
+            echo "## Derleme başarısız"
+            echo "Aşağıdaki kutunun içindekini kopyalayıp Claude'a yapıştır:"
+            echo '```'
+            grep -n -E "error:|What went wrong|Could not|FAILED|Execution failed|Unsupported|Mixin" -A3 build.log | head -n 120
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+      # 7) Başarısızsa tam log dosyasını da sakla (Actions sayfasından indirilir)
+      - name: Log dosyasını sakla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ env.PROJECT_DIR }}/build.log
+          if-no-files-found: ignore
+
+      # 8) Çıkan jar'ı seç ve gerçekten oyunda çalışacak biçimde mi diye doğrula
+      - name: Jar'ı seç ve doğrula
+        run: |
+          set -e
+          JAR=$(ls -1 "$PROJECT_DIR"/build/libs/*.jar | grep -v -- '-sources.jar' | grep -v -- '-dev.jar' | head -n1)
+          if [ -z "$JAR" ]; then
+            echo "::error::build/libs içinde .jar bulunamadı."
+            exit 1
+          fi
+          mkdir -p out
+          cp "$JAR" out/AutoSchematicBuilder-1.21.11.jar
+          echo "--- jar içeriği (özet) ---"
+          unzip -l out/AutoSchematicBuilder-1.21.11.jar | grep -E "fabric.mod.json|mixins.json|refmap|AutoSchematicMod|Features.class" || true
+          # Sınıflar oyunun kullandığı adlara (class_xxx) çevrilmiş olmalı; yoksa oyunda çöker
+          unzip -p out/AutoSchematicBuilder-1.21.11.jar tr/autoschematic/core/Features.class | strings | grep -q "net/minecraft/class_" \
+            || { echo "::error::jar intermediary adlarına çevrilmemiş (remap olmamış)."; exit 1; }
+          # fabric.mod.json içindeki ${version} yer tutucusu doldurulmuş olmalı
+          if unzip -p out/AutoSchematicBuilder-1.21.11.jar fabric.mod.json | grep -q '\${version}'; then
+            echo "::error::fabric.mod.json sürüm yer tutucusu doldurulmamış."
+            exit 1
+          fi
+          ls -l out
+
+      # 9) Jar'ı "Releases" sayfasına koy: doğrudan indirilebilir .jar (zip değil)
+      - name: Release oluştur
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}-${{ github.run_attempt }}"
+          gh release create "$TAG" out/AutoSchematicBuilder-1.21.11.jar \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Auto Schematic Builder build ${{ github.run_number }}" \
+            --notes "Minecraft 1.21.11 (Fabric). mods klasörüne atılacak dosya: AutoSchematicBuilder-1.21.11.jar"
